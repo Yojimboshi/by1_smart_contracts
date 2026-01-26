@@ -11,7 +11,8 @@ describe("PredictionMarket", function () {
     oracleSigner: SignerWithAddress,
     roundId: string,
     closePrice: bigint,
-    outcome: number
+    outcome: number,
+    timestamp?: bigint
   ): Promise<string> {
     const domain = {
       name: "PredictionMarket",
@@ -31,15 +32,16 @@ describe("PredictionMarket", function () {
       ],
     };
 
-    // Get current timestamp (will match block.timestamp when settleRound is called)
-    const timestamp = await time.latest();
+    // Use provided timestamp or get current block timestamp + 1
+    const currentTime = await time.latest();
+    const settledAt = timestamp || BigInt(currentTime + 1);
     const value = {
       roundId,
       closePrice,
       outcome,
       chainId: (await ethers.provider.getNetwork()).chainId,
       contractAddress: await predictionMarket.getAddress(),
-      settledAt: timestamp,
+      settledAt,
     };
 
     return await oracleSigner.signTypedData(domain, types, value);
@@ -282,7 +284,7 @@ describe("PredictionMarket", function () {
       );
 
       // Move time past lock time
-      await time.increaseTo(lockTime + 1n);
+      await time.increaseTo(Number(lockTime) + 1);
 
       await expect(
         predictionMarket.connect(user1).placeBet(roundId, true, 0, await weth.getAddress(), {
@@ -323,7 +325,7 @@ describe("PredictionMarket", function () {
         .placeBet(roundId, false, 0, await fixture.weth.getAddress(), { value: betAmount });
 
       // Move time past lock time
-      await time.increaseTo(lockTime + 1n);
+      await time.increaseTo(Number(lockTime) + 1);
 
       return { ...fixture, roundId, lockTime };
     }
@@ -364,7 +366,7 @@ describe("PredictionMarket", function () {
 
       await expect(
         predictionMarket.settleRound(roundId, closePrice, outcome, invalidSignature)
-      ).to.be.revertedWithCustomError(predictionMarket, "InvalidSignature");
+      ).to.be.revertedWithCustomError(predictionMarket, "ECDSAInvalidSignature");
     });
 
     it("Should revert if round already settled", async function () {
@@ -420,7 +422,7 @@ describe("PredictionMarket", function () {
         .placeBet(roundId, false, 0, await fixture.weth.getAddress(), { value: betAmount });
 
       // Move time past lock time and settle
-      await time.increaseTo(lockTime + 1n);
+      await time.increaseTo(lockTime + 1);
 
       const closePrice = ethers.parseEther("50000");
       const outcome = 1; // UP
@@ -479,7 +481,7 @@ describe("PredictionMarket", function () {
         .connect(fixture.user1)
         .placeBet(roundId, true, 0, await fixture.weth.getAddress(), { value: betAmount });
 
-      await time.increaseTo(lockTime + 1n);
+      await time.increaseTo(lockTime + 1);
 
       // Settle as TIE
       const closePrice = ethers.parseEther("50000");

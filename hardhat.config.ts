@@ -1,7 +1,7 @@
-require("@nomicfoundation/hardhat-toolbox");
+import { HardhatUserConfig } from "hardhat/config";
+import "@nomicfoundation/hardhat-toolbox";
 
-/** @type import('hardhat/config').HardhatUserConfig */
-const config = {
+const config: HardhatUserConfig = {
   solidity: {
     version: "0.8.24",
     settings: {
@@ -41,7 +41,9 @@ const config = {
     outDir: "./typechain-types",
     target: "ethers-v6",
   },
+  mocha: {
+    timeout: 40000,
+  },
 };
 
-module.exports = config;
-
+export default config;
