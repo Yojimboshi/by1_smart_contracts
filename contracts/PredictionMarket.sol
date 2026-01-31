@@ -166,8 +166,8 @@ contract PredictionMarket is EIP712, Ownable, ReentrancyGuard, Pausable {
         uint256 lockTime,
         uint256 endTime
     ) external onlyOwner {
-        require(lockTime > startTime, "Lock time must be after start");
-        require(endTime > lockTime, "End time must be after lock");
+        require(lockTime <= startTime, "Lock time must be before or at start");
+        require(endTime > startTime, "End time must be after start");
         require(
             bytes(rounds[roundId].roundId).length == 0,
             "Round already exists"
@@ -271,11 +271,13 @@ contract PredictionMarket is EIP712, Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @dev Settle a round using server-signed settlement (anyone can call)
+     * @param settledAt Unix timestamp when settlement was signed (must be within reasonable window of block.timestamp)
      */
     function settleRound(
         string memory roundId,
         uint256 closePrice,
         uint8 outcome,
+        uint256 settledAt,
         bytes memory signature
     ) external nonReentrant {
         Round storage round = rounds[roundId];
@@ -284,8 +286,18 @@ contract PredictionMarket is EIP712, Ownable, ReentrancyGuard, Pausable {
         if (round.settled) revert RoundAlreadySettled();
         if (outcome > 2) revert InvalidOutcome();
 
+        // Validate settledAt is within reasonable window (allow 1 hour in past, 5 minutes in future for clock skew)
+        require(
+            settledAt <= block.timestamp + 300,
+            "Settlement timestamp too far in future"
+        );
+        require(
+            settledAt >= block.timestamp - 3600,
+            "Settlement timestamp too far in past"
+        );
+
         // Verify signature
-        bytes32 hash = _hashSettlement(roundId, closePrice, outcome);
+        bytes32 hash = _hashSettlement(roundId, closePrice, outcome, settledAt);
         address signer = hash.recover(signature);
 
         if (signer != oracleSigner) revert InvalidSignature();
@@ -497,11 +509,13 @@ contract PredictionMarket is EIP712, Ownable, ReentrancyGuard, Pausable {
 
     /**
      * @dev Hash settlement message for EIP-712
+     * @param settledAt Unix timestamp when settlement was signed (must match signature)
      */
     function _hashSettlement(
         string memory roundId,
         uint256 closePrice,
-        uint8 outcome
+        uint8 outcome,
+        uint256 settledAt
     ) internal view returns (bytes32) {
         bytes32 structHash = keccak256(
             abi.encode(
@@ -511,7 +525,7 @@ contract PredictionMarket is EIP712, Ownable, ReentrancyGuard, Pausable {
                 outcome,
                 block.chainid,
                 address(this),
-                block.timestamp
+                settledAt
             )
         );
         return _hashTypedDataV4(structHash);
