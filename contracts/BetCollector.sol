@@ -25,14 +25,14 @@ interface IWETH {
  *
  * Philosophy:
  * - Contract only handles money movement (deposits/withdrawals)
- * - Server handles all game logic, round management, outcome calculation
- * - Minimal gas usage - no on-chain round creation or settlement
+ * - Settlement logic (Binance API, who won) is off-chain; anyone can submit the result
+ * - setWithdrawable / batchSetWithdrawable are permissionless - caller pays gas
  *
  * Flow:
  * 1. User approves token spending
  * 2. User calls placeBet() - transfers tokens to contract
- * 3. Server tracks bets, rounds, outcomes in database
- * 4. Server calls setWithdrawable() to allow winners to withdraw
+ * 3. Off-chain: server/Binance determines round outcome
+ * 4. Anyone calls setWithdrawable/batchSetWithdrawable with correct (users, amounts) - caller pays gas
  * 5. User calls withdraw() to claim winnings
  */
 contract BetCollector is Ownable, ReentrancyGuard, Pausable {
@@ -44,6 +44,9 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
 
     // Mapping: supported tokens
     mapping(address => bool) public supportedTokens;
+
+    // roundId (keccak256) => true if already settled. Prevents double-settlement / double-credit.
+    mapping(bytes32 => bool) public settledRounds;
 
     // Events
     event BetPlaced(
@@ -75,6 +78,7 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
     error InvalidAmount();
     error InsufficientWithdrawable();
     error TransferFailed();
+    error RoundAlreadySettled();
 
     constructor(address _weth) Ownable(msg.sender) {
         require(_weth != address(0), "Invalid WETH address");
@@ -139,40 +143,40 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
     }
 
     /**
-     * @dev Set withdrawable amount for a user (admin only)
-     * Called by server after round settlement
-     * @param user User address
-     * @param token Token address
-     * @param amount Amount user can withdraw
-     * @param roundId Round identifier (for event logging only)
+     * @dev Set withdrawable amount for a user (permissionless - caller pays gas)
+     * Settlement data must match off-chain outcome (Binance API). settledRounds prevents double-credit.
      */
     function setWithdrawable(
         address user,
         address token,
         uint256 amount,
         string calldata roundId
-    ) external onlyOwner {
+    ) external {
+        bytes32 rId = keccak256(abi.encodePacked(roundId));
+        if (settledRounds[rId]) revert RoundAlreadySettled();
+        settledRounds[rId] = true;
         withdrawableBalances[user][token] += amount;
         emit WithdrawableSet(user, token, amount, roundId);
     }
 
     /**
-     * @dev Batch set withdrawable amounts (gas efficient for multiple users)
-     * @param users Array of user addresses
-     * @param tokens Array of token addresses (must match users length)
-     * @param amounts Array of amounts (must match users length)
-     * @param roundId Round identifier (for event logging only)
+     * @dev Batch set withdrawable amounts (permissionless - caller pays gas)
+     * Settlement data must match off-chain outcome. settledRounds prevents double-credit.
      */
     function batchSetWithdrawable(
         address[] calldata users,
         address[] calldata tokens,
         uint256[] calldata amounts,
         string calldata roundId
-    ) external onlyOwner {
+    ) external {
         require(
             users.length == tokens.length && tokens.length == amounts.length,
             "Array length mismatch"
         );
+
+        bytes32 rId = keccak256(abi.encodePacked(roundId));
+        if (settledRounds[rId]) revert RoundAlreadySettled();
+        settledRounds[rId] = true;
 
         for (uint256 i = 0; i < users.length; i++) {
             withdrawableBalances[users[i]][tokens[i]] += amounts[i];
@@ -233,6 +237,14 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
         address token
     ) external view returns (uint256) {
         return withdrawableBalances[user][token];
+    }
+
+    /**
+     * @dev Check if a round was already settled (prevents double-settlement)
+     * @param roundId Round identifier
+     */
+    function isRoundSettled(string calldata roundId) external view returns (bool) {
+        return settledRounds[keccak256(abi.encodePacked(roundId))];
     }
 
     /**
