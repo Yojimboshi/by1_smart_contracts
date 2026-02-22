@@ -12,9 +12,13 @@ async function main() {
 
     console.log("Using WBNB address:", wbnbAddress);
 
+    // Settlement signer: address that signs settlement data (from BET_COLLECTOR_SETTLEMENT_SIGNER_PRIVATE_KEY or deployer)
+    const settlementSigner = process.env.BET_COLLECTOR_SETTLEMENT_SIGNER_ADDRESS || deployer.address;
+    console.log("Settlement signer:", settlementSigner);
+
     // Deploy BetCollector contract
     const BetCollector = await ethers.getContractFactory("BetCollector");
-    const betCollector = await BetCollector.deploy(wbnbAddress);
+    const betCollector = await BetCollector.deploy(wbnbAddress, settlementSigner);
 
     await betCollector.waitForDeployment();
     const address = await betCollector.getAddress();
@@ -22,11 +26,13 @@ async function main() {
     console.log("BetCollector deployed to:", address);
     console.log("WBNB address:", wbnbAddress);
 
-    // Verify deployment by checking owner and WETH address
+    // Verify deployment by checking owner, WETH, and settlement signer
     const owner = await betCollector.owner();
     const weth = await betCollector.weth();
+    const signer = await betCollector.settlementSigner();
     console.log("Contract owner:", owner);
     console.log("Contract WETH:", weth);
+    console.log("Settlement signer:", signer);
 
     // Check if WBNB is supported
     const isWbnbSupported = await betCollector.supportedTokens(wbnbAddress);

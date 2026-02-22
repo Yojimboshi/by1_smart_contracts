@@ -25,14 +25,14 @@ interface IWETH {
  *
  * Philosophy:
  * - Contract only handles money movement (deposits/withdrawals)
- * - Settlement logic (Binance API, who won) is off-chain; anyone can submit the result
- * - setWithdrawable / batchSetWithdrawable are permissionless - caller pays gas
+ * - Settlement logic (Binance API, who won) is off-chain; DB tracks settlement state
+ * - setWithdrawable / batchSetWithdrawable are owner-only; DB prevents double-settlement (saves gas)
  *
  * Flow:
  * 1. User approves token spending
  * 2. User calls placeBet() - transfers tokens to contract
- * 3. Off-chain: server/Binance determines round outcome
- * 4. Anyone calls setWithdrawable/batchSetWithdrawable with correct (users, amounts) - caller pays gas
+ * 3. Off-chain: server/Binance determines round outcome, DB tracks settlement
+ * 4. Owner calls setWithdrawable/batchSetWithdrawable with correct (users, amounts)
  * 5. User calls withdraw() to claim winnings
  */
 contract BetCollector is Ownable, ReentrancyGuard, Pausable {
@@ -42,11 +42,11 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
     // Mapping: user => token => withdrawable amount
     mapping(address => mapping(address => uint256)) public withdrawableBalances;
 
+    // roundId (keccak256) => true if already settled. Prevents double-settlement / replay.
+    mapping(bytes32 => bool) public settledRounds;
+
     // Mapping: supported tokens
     mapping(address => bool) public supportedTokens;
-
-    // roundId (keccak256) => true if already settled. Prevents double-settlement / double-credit.
-    mapping(bytes32 => bool) public settledRounds;
 
     // Events
     event BetPlaced(
@@ -75,10 +75,10 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
 
     // Errors
     error TokenNotSupported();
+    error RoundAlreadySettled();
     error InvalidAmount();
     error InsufficientWithdrawable();
     error TransferFailed();
-    error RoundAlreadySettled();
 
     constructor(address _weth) Ownable(msg.sender) {
         require(_weth != address(0), "Invalid WETH address");
@@ -94,36 +94,40 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
      * @param amount Amount to bet (in wei) - ignored if sending native ETH
      * @param roundId Round identifier (for event logging only)
      * @param isUp true for UP bet, false for DOWN bet (for event logging only)
+     * @param from Address to transfer tokens from (must have approved this contract). If address(0), uses msg.sender
      *
      * Usage:
-     * - Native ETH: Send ETH via msg.value, token = WETH address, amount = 0
-     * - ERC-20: Approve token first, then call with msg.value = 0
+     * - Native ETH: Send ETH via msg.value, token = WETH address, amount = 0, from = address(0)
+     * - ERC-20 (self): Approve token first, then call with msg.value = 0, from = address(0)
+     * - ERC-20 (proxy): User approves contract, any signer calls with from = user address
      */
     function placeBet(
         address token,
         uint256 amount,
         string calldata roundId,
-        bool isUp
+        bool isUp,
+        address from
     ) external payable nonReentrant whenNotPaused {
         if (!supportedTokens[token]) revert TokenNotSupported();
+
+        // If from is address(0), use msg.sender (backward compatible)
+        address sender = from == address(0) ? msg.sender : from;
 
         uint256 betAmount = 0;
 
         // Handle native ETH (auto-wrap to WETH)
         if (token == address(weth)) {
             if (msg.value > 0) {
-                // Native ETH: auto-wrap to WETH
+                // Native ETH: auto-wrap to WETH (only works if from == address(0) or from == msg.sender)
+                if (from != address(0) && from != msg.sender)
+                    revert InvalidAmount();
                 betAmount = msg.value;
                 weth.deposit{value: msg.value}();
             } else {
                 // WETH directly: transferFrom
                 if (amount == 0) revert InvalidAmount();
                 betAmount = amount;
-                bool success = weth.transferFrom(
-                    msg.sender,
-                    address(this),
-                    amount
-                );
+                bool success = weth.transferFrom(sender, address(this), amount);
                 if (!success) revert TransferFailed();
             }
         } else {
@@ -132,48 +136,44 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
             if (amount == 0) revert InvalidAmount();
             betAmount = amount;
             bool success = IERC20(token).transferFrom(
-                msg.sender,
+                sender,
                 address(this),
                 amount
             );
             if (!success) revert TransferFailed();
         }
 
-        emit BetPlaced(msg.sender, token, betAmount, roundId, isUp);
+        emit BetPlaced(sender, token, betAmount, roundId, isUp);
     }
 
     /**
-     * @dev Set withdrawable amount for a user (permissionless - caller pays gas)
-     * Settlement data must match off-chain outcome (Binance API). settledRounds prevents double-credit.
+     * @dev Set withdrawable amount for a user (owner only)
+     * DB tracks settlement state to prevent double-settlement; saves gas vs on-chain storage.
      */
     function setWithdrawable(
         address user,
         address token,
         uint256 amount,
         string calldata roundId
-    ) external {
-        bytes32 rId = keccak256(abi.encodePacked(roundId));
-        if (settledRounds[rId]) revert RoundAlreadySettled();
-        settledRounds[rId] = true;
+    ) external onlyOwner {
         withdrawableBalances[user][token] += amount;
         emit WithdrawableSet(user, token, amount, roundId);
     }
 
     /**
-     * @dev Batch set withdrawable amounts (permissionless - caller pays gas)
-     * Settlement data must match off-chain outcome. settledRounds prevents double-credit.
+     * @dev Batch set withdrawable amounts (owner only)
+     * DB tracks settlement state to prevent double-settlement; saves gas vs on-chain storage.
      */
     function batchSetWithdrawable(
         address[] calldata users,
         address[] calldata tokens,
         uint256[] calldata amounts,
         string calldata roundId
-    ) external {
+    ) external onlyOwner {
         require(
             users.length == tokens.length && tokens.length == amounts.length,
             "Array length mismatch"
         );
-
         bytes32 rId = keccak256(abi.encodePacked(roundId));
         if (settledRounds[rId]) revert RoundAlreadySettled();
         settledRounds[rId] = true;
@@ -243,7 +243,9 @@ contract BetCollector is Ownable, ReentrancyGuard, Pausable {
      * @dev Check if a round was already settled (prevents double-settlement)
      * @param roundId Round identifier
      */
-    function isRoundSettled(string calldata roundId) external view returns (bool) {
+    function isRoundSettled(
+        string calldata roundId
+    ) external view returns (bool) {
         return settledRounds[keccak256(abi.encodePacked(roundId))];
     }
 
